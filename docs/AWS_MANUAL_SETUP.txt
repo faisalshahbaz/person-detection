@@ -1,0 +1,249 @@
+AWS Manual Setup Guide (no Terraform)
+Person Detection Platform — learn-by-doing in the AWS Console / CLI
+
+BEGINNER DIAGRAMS (one picture per step):
+  See AWS_SETUP_BEGINNER.md in this folder — open in Cursor/GitHub to render Mermaid.
+
+AWS WEBSITE (CONSOLE) CLICK-BY-CLICK:
+  See AWS_CONSOLE_WEBSITE_GUIDE.txt — every step: where to click in console.aws.amazon.com
+
+This guide matches the architecture in the project plan: Streamlit frontend, FastAPI backend,
+ML service (YOLOv8n ONNX), Redis for sessions. You can start with Tier 1 (one EC2) before
+Tier 2 (ECS Fargate + ALB + private networking).
+
+================================================================================
+PART 0 — What you are building on AWS
+================================================================================
+
+Internet users
+    -> HTTPS -> Application Load Balancer (ALB) -> Frontend (Streamlit :8501)
+    -> HTTPS -> ALB (api host) -> Backend (FastAPI :8000)
+    -> UDP/WebRTC -> NLB + coturn (production webcam relay; skip on localhost demo)
+
+Backend talks ONLY to:
+    - Redis (sessions / limits)
+    - ML service (POST /predict + internal token)
+    - S3 (uploaded videos in production)
+
+Frontend NEVER talks to ML directly.
+
+================================================================================
+PART 1 — Tier 1 DEMO (recommended first): Single EC2 + Docker Compose
+================================================================================
+Goal: Understand containers and ports before VPC/ECS complexity.
+Cost: t3.small or t3.medium (~$15–30/mo if left running 24/7).
+
+Step 1 — IAM (minimal)
+  - Use your root account only for billing; create an IAM user "deploy-admin" with
+    AdministratorAccess for learning OR scoped policies (EC2, ECR, ECS later).
+  - Create access keys only if you use AWS CLI; enable MFA on root.
+
+Step 2 — EC2 instance
+  - Region: pick one (e.g. us-east-1) and stay in it for all resources.
+  - Launch: Amazon Linux 2023 or Ubuntu 22.04, t3.small+, 30 GB gp3.
+  - Key pair: download .pem for SSH.
+  - Security group (inbound):
+      SSH 22 from YOUR IP only
+      HTTP 80, HTTPS 443 from 0.0.0.0/0 (if using Caddy/Let's Encrypt)
+      TCP 8501 from YOUR IP (or only 443 if reverse proxy)
+      UDP 49152-65535 from 0.0.0.0/0 (WebRTC media for public webcam demo)
+  - Assign Elastic IP optional (stable public IP for DNS).
+
+Step 3 — Install Docker on EC2
+  - SSH in, install Docker + compose plugin (see docs/DEPLOY_DEMO.txt if present).
+  - Clone/copy person-detection folder to the instance.
+
+Step 4 — Run stack
+  - cp .env.example .env, set JWT_SECRET and ML_INTERNAL_TOKEN.
+  - docker compose up --build -d
+  - Test: curl localhost:9000/healthz, :8000/healthz, open :8501 via SSH tunnel:
+      ssh -L 8501:localhost:8501 ec2-user@<EIP>
+    Browser: http://localhost:8501 (webcam works on localhost secure context).
+
+Step 5 — Optional public HTTPS
+  - Route 53 or external DNS A record -> EC2 public IP.
+  - Caddy/nginx on EC2 terminating TLS -> frontend:8501.
+
+What you learned: security groups, ports, Docker networking, no VPC design yet.
+
+================================================================================
+PART 2 — Tier 2 PRODUCTION (manual ECS Fargate) — build in this order
+================================================================================
+
+--- Phase A: Networking (VPC) ---
+
+1. VPC
+   - Create VPC e.g. 10.20.0.0/16, DNS hostnames ON.
+
+2. Subnets (2 Availability Zones minimum for production)
+   - Public subnets: 10.20.0.0/24, 10.20.1.0/24 (map public IP on launch)
+   - Private subnets: 10.20.8.0/24, 10.20.9.0/24 (no public IP)
+
+3. Internet Gateway
+   - Attach to VPC; public route table 0.0.0.0/0 -> IGW.
+
+4. NAT Gateway (one per AZ or one for cost savings in dev)
+   - Place in PUBLIC subnet; Elastic IP for NAT.
+   - Private route table 0.0.0.0/0 -> NAT (so Fargate tasks can pull ECR images).
+
+5. Security groups (create separately, attach to resources)
+   - sg-alb: inbound 443 from 0.0.0.0/0
+   - sg-frontend: inbound 8501 from sg-alb; UDP from sg-coturn if using TURN
+   - sg-backend: inbound 8000 from sg-alb and sg-frontend
+   - sg-ml: inbound 9000 from sg-backend ONLY
+   - sg-redis: inbound 6379 from sg-backend ONLY
+   - sg-coturn: UDP 3478 + 49152-65535 from internet (WebRTC relay)
+
+Rule of thumb: ML has no public access; only backend can call it.
+
+--- Phase B: Container images (ECR) ---
+
+6. Amazon ECR
+   - Create repositories: person-detection/frontend, backend, ml-service
+   - On your laptop (after docker login to ECR):
+       aws ecr get-login-password --region REGION | docker login ...
+       docker build -t REPO/frontend:latest ./frontend && docker push ...
+     (same for backend, ml-service)
+
+Why ECR: Fargate pulls images from ECR in your account; tasks in private subnets
+reach ECR via NAT.
+
+--- Phase C: Secrets and config ---
+
+7. AWS Secrets Manager (or SSM Parameter Store)
+   - Store: JWT_SECRET, ML_INTERNAL_TOKEN, TURN_SHARED_SECRET
+   - ECS task definitions reference secrets as environment variables at launch.
+
+8. S3 bucket
+   - Name: unique e.g. person-detection-uploads-ACCOUNTID
+   - Block public access ON
+   - Lifecycle rule: delete uploads/ prefix after 7 days
+   - Backend task IAM role: s3:PutObject, s3:GetObject on that bucket
+
+--- Phase D: Redis (sessions) ---
+
+9. ElastiCache Redis
+   - Subnet group: private subnets
+   - Security group: sg-redis
+   - Node: cache.t3.micro for dev
+   - Note endpoint: backend REDIS_URL=redis://ENDPOINT:6379/0
+
+--- Phase E: Load balancers ---
+
+10. ACM certificate
+    - Request cert in same region as ALB for app.example.com and api.example.com
+    - Validate via DNS (Route 53 or CNAME at your registrar)
+
+11. Application Load Balancer (ALB)
+    - Internet-facing, public subnets, sg-alb
+    - Listener HTTPS 443 with ACM cert
+    - Target group A: frontend tasks port 8501, health path /_stcore/health
+    - Target group B: backend tasks port 8000, health path /healthz
+    - Listener rule: host api.example.com -> target group B; default -> frontend
+
+12. Network Load Balancer (NLB) — for WebRTC TURN only
+    - UDP listener 3478 -> coturn tasks (optional until you need public webcam)
+
+--- Phase F: ECS cluster and services ---
+
+13. ECS cluster
+    - Enable Container Insights (CloudWatch)
+
+14. Cloud Map (Service Discovery) — private DNS for ML
+    - Namespace: person-detection.local
+    - Service "ml" -> ML tasks register A records
+    - Backend env: ML_SERVICE_URL=http://ml.person-detection.local:9000
+
+15. Task definitions (Fargate, awsvpc, CPU/memory per service)
+    - Execution role: pull ECR, write logs, read Secrets Manager
+    - Task role (backend only): S3 access
+    - Log driver: awslogs to CloudWatch log groups
+
+16. ECS services (desired count, private subnets, no public IP)
+    - ml-service: sg-ml, service discovery, no ALB
+    - backend: sg-backend, register to ALB target group B
+    - frontend: sg-frontend, register to ALB target group A
+    - coturn: public subnet or special case, NLB (later)
+
+17. Auto scaling (optional)
+    - ML service: target tracking on CPU e.g. 70%, min 1 max 4
+
+--- Phase G: DNS ---
+
+18. Route 53
+    - app.example.com ALIAS -> ALB
+    - api.example.com ALIAS -> same ALB (routing by host header)
+
+--- Phase H: Frontend env in ECS ---
+
+19. Frontend task environment
+    - BACKEND_URL=https://api.example.com
+    - STUN_SERVER=stun:<NLB-DNS>:3478 when using coturn
+
+--- Phase I: Cognito (optional, production auth) ---
+
+20. Cognito User Pool + app client
+    - Replace demo JWT users in backend when ready
+    - Frontend uses Cognito hosted UI or API auth
+
+--- Phase J: Monitoring ---
+
+21. CloudWatch
+    - Log groups per service
+    - Alarms: ALB 5xx, ECS CPU high, unhealthy targets
+22. AWS Budgets
+    - Monthly budget + email alert at 80%
+
+================================================================================
+PART 3 — How manual steps map to “who talks to whom”
+================================================================================
+
+User browser -> ALB (443) -> frontend container
+Frontend container -> backend (https://api.example.com or internal http://backend:8000 in compose)
+Backend -> Redis (sessions)
+Backend -> ML (http://ml.local:9000/predict + X-Internal-Token)
+Backend -> S3 (uploads)
+User browser -> NLB UDP -> coturn -> frontend (WebRTC path, production)
+
+================================================================================
+PART 4 — CLI vs Console
+================================================================================
+
+You can do EVERY step in AWS Console (VPC wizard, ECS “Create cluster” wizard).
+CLI is the same APIs; use console first to see relationships, then automate later.
+
+Useful CLI checks after setup:
+  aws ecs list-services --cluster person-detection-cluster
+  aws elbv2 describe-target-health --target-group-arn ...
+  aws logs tail /ecs/person-detection/backend --follow
+
+================================================================================
+PART 5 — Cost traps when learning manually
+================================================================================
+
+- NAT Gateway: ~$32/mo + data processing (biggest surprise)
+- ALB + NLB: ~$16/mo each + LCU
+- Fargate: vCPU/memory hours per task 24/7
+- Elastic IP: free while attached to running instance/NAT
+
+For learning: start Tier 1 EC2; tear down Tier 2 nightly (scale ECS to 0, delete NAT if possible).
+
+================================================================================
+PART 6 — Suggested learning path
+================================================================================
+
+Week 1: EC2 + docker compose (Tier 1), security groups, SSH tunnel
+Week 2: ECR push images; run ONE Fargate task manually (ml-service) in public subnet test
+Week 3: VPC private subnets + NAT; move tasks private; add ALB + one service
+Week 4: Add backend, frontend, Redis, S3; DNS + ACM
+Week 5: NLB + coturn for WebRTC; Cognito; budgets and alarms
+
+Terraform later = same resources, declared in code. Manual first builds mental model.
+
+================================================================================
+Local reference (already in repo)
+================================================================================
+
+docker-compose.yml  — same three apps, mimics service names (backend, ml-service, redis)
+docs/RUN_SERVICES.txt — local run order
+.env.example          — env vars you will mirror in ECS task definitions

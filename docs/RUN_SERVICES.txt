@@ -1,0 +1,33 @@
+Run everything locally (recommended)
+
+  cd person-detection
+  cp .env.example .env    # first time only; skip if .env exists
+  docker compose up --build
+
+  UI:      http://localhost:8501
+  API:     http://localhost:8000/healthz
+  ML:      http://localhost:9000/healthz
+
+Run in background:
+
+  docker compose up --build -d
+  docker compose logs -f frontend
+
+Stop:
+
+  docker compose down
+
+---
+
+Run one service at a time
+
+  docker compose up ml-service -d
+  docker compose up redis -d
+  docker compose up backend -d    # also waits for redis + ml-service (depends_on)
+  docker compose up frontend -d   # waits for backend
+
+Rebuild after code changes:
+
+  docker compose up --build ml-service -d
+
+Docker Desktop: ensure Docker is running and context is desktop-linux (or default if in docker group).

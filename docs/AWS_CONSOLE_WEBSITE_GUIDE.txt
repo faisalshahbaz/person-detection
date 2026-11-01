@@ -1,0 +1,467 @@
+================================================================================
+AWS WEBSITE (CONSOLE) CONFIGURATION — Person Detection Platform
+================================================================================
+How to use this guide:
+  - Sign in: https://console.aws.amazon.com
+  - Pick ONE region (top-right), e.g. US East (N. Virginia) us-east-1 — keep ALL
+    steps in the same region.
+  - Do Tier 1 first (EC2). Tier 2 when Tier 1 works locally on the instance.
+  - Diagrams: AWS_SETUP_BEGINNER.md (same folder)
+
+================================================================================
+TIER 1 — EC2 DEMO (configure on AWS website)
+================================================================================
+
+------------------------------------------------------------------------------
+CONSOLE STEP A1 — IAM user (do once)
+------------------------------------------------------------------------------
+Where: Search bar → "IAM" → IAM Dashboard
+
+1. Left menu → Users → Create user
+2. User name: deploy-admin
+3. Next → Attach policies directly → search AdministratorAccess → check box
+   (For learning only; use smaller policies in real production.)
+4. Create user
+5. Optional CLI: User → Security credentials → Create access key → CLI → Save CSV
+
+Verify: IAM → Users → deploy-admin shows AdministratorAccess
+
+------------------------------------------------------------------------------
+CONSOLE STEP A2 — EC2 key pair
+------------------------------------------------------------------------------
+Where: EC2 → Network & Security → Key Pairs → Create key pair
+
+1. Name: person-detection-key
+2. Type: RSA, Format: .pem
+3. Create → browser downloads .pem
+4. On your laptop: chmod 400 person-detection-key.pem
+
+------------------------------------------------------------------------------
+CONSOLE STEP A3 — Security group for EC2
+------------------------------------------------------------------------------
+Where: EC2 → Network & Security → Security Groups → Create security group
+
+1. Name: person-detection-ec2-sg
+2. Description: Demo EC2 for docker compose
+3. VPC: default VPC is OK for Tier 1 demo
+4. Inbound rules → Add rule (each row):
+   | Type        | Port      | Source              | Why                    |
+   |-------------|-----------|---------------------|------------------------|
+   | SSH         | 22        | My IP               | SSH login              |
+   | Custom TCP  | 8501      | My IP               | Streamlit (optional)   |
+   | HTTP        | 80        | 0.0.0.0/0           | Optional HTTPS proxy   |
+   | HTTPS       | 443       | 0.0.0.0/0           | Optional HTTPS proxy   |
+   | Custom UDP  | 49152-65535 | 0.0.0.0/0         | WebRTC if public demo  |
+5. Outbound: All traffic (default) → Create
+
+Verify: Security group list shows person-detection-ec2-sg
+
+------------------------------------------------------------------------------
+CONSOLE STEP A4 — Launch EC2 instance
+------------------------------------------------------------------------------
+Where: EC2 → Instances → Launch instances
+
+1. Name: person-detection-demo
+2. AMI: Ubuntu Server 22.04 LTS (or Amazon Linux 2023)
+3. Instance type: t3.small (minimum) or t3.medium
+4. Key pair: person-detection-key
+5. Network settings → Edit:
+   - VPC: default
+   - Auto-assign public IP: Enable
+   - Firewall: Select existing → person-detection-ec2-sg
+6. Storage: 30 GiB gp3
+7. Launch instance
+
+Wait: Instance state → Running, Status check → 2/2 passed
+
+Copy: Public IPv4 address (e.g. 3.85.x.x)
+
+------------------------------------------------------------------------------
+CONSOLE STEP A5 — Elastic IP (optional, stable URL)
+------------------------------------------------------------------------------
+Where: EC2 → Network & Security → Elastic IPs → Allocate Elastic IP address
+
+1. Allocate
+2. Actions → Associate Elastic IP address → select your instance → Associate
+
+Use this IP in SSH and DNS.
+
+------------------------------------------------------------------------------
+CONSOLE STEP A6 — Connect (SSH) — on your laptop, not console
+------------------------------------------------------------------------------
+  ssh -i person-detection-key.pem ubuntu@YOUR_PUBLIC_IP
+
+Amazon Linux user may be ec2-user instead of ubuntu.
+
+------------------------------------------------------------------------------
+CONSOLE STEP A7 — On the instance: install Docker (SSH terminal)
+------------------------------------------------------------------------------
+Ubuntu example:
+  sudo apt update && sudo apt install -y docker.io docker-compose-v2 git
+  sudo usermod -aG docker $USER
+  # log out and SSH back in
+
+Copy project (git clone, scp, or zip upload).
+
+------------------------------------------------------------------------------
+CONSOLE STEP A8 — Run app on EC2 (SSH)
+------------------------------------------------------------------------------
+  cd person-detection
+  cp .env.example .env
+  # edit .env: JWT_SECRET, ML_INTERNAL_TOKEN
+  docker compose up --build -d
+  curl -s localhost:9000/healthz
+  curl -s localhost:8000/healthz
+
+Webcam from laptop:
+  ssh -i key.pem -L 8501:localhost:8501 ubuntu@YOUR_IP
+  Browser: http://localhost:8501
+
+Tier 1 AWS website work is DONE when health checks pass on the instance.
+
+
+================================================================================
+TIER 2 — PRODUCTION ECS (configure each service on AWS website)
+================================================================================
+
+------------------------------------------------------------------------------
+CONSOLE STEP B1 — VPC
+------------------------------------------------------------------------------
+Where: VPC → Your VPCs → Create VPC
+
+Option A (easy): VPC and more → Name person-detection-vpc, IPv4 CIDR 10.20.0.0/16,
+  2 AZs, 2 public subnets, 2 private subnets, 1 NAT gateway → Create
+
+Option B (manual):
+  1. Create VPC only → name person-detection-vpc, IPv4 10.20.0.0/16
+  2. Edit VPC settings → Enable DNS hostnames
+  3. Subnets → Create (4 subnets, 2 public + 2 private in 2 AZs)
+  4. Internet gateway → Create → Attach to person-detection-vpc
+  5. Route tables → public: 0.0.0.0/0 → IGW; private: 0.0.0.0/0 → NAT
+
+Verify: VPC → Resource map shows IGW and NAT
+
+------------------------------------------------------------------------------
+CONSOLE STEP B2 — Security groups (production)
+------------------------------------------------------------------------------
+Where: VPC → Security groups → Create (repeat for each)
+
+Create these (VPC = person-detection-vpc):
+
+1) sg-alb-person-detection
+   Inbound: HTTPS 443 from 0.0.0.0/0
+
+2) sg-frontend
+   Inbound: TCP 8501 from sg-alb-person-detection
+
+3) sg-backend
+   Inbound: TCP 8000 from sg-alb-person-detection AND sg-frontend
+
+4) sg-ml
+   Inbound: TCP 9000 from sg-backend ONLY
+
+5) sg-redis
+   Inbound: TCP 6379 from sg-backend ONLY
+
+6) sg-coturn (later, WebRTC)
+   Inbound: UDP 3478, UDP 49152-65535 from 0.0.0.0/0
+
+Verify: Each SG shows only the rules above.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B3 — ECR repositories
+------------------------------------------------------------------------------
+Where: ECR → Private registry → Repositories → Create repository
+
+Create three (Visibility private):
+  - person-detection/frontend
+  - person-detection/backend
+  - person-detection/ml-service
+
+For each repo: View push commands → copy login + docker build + push (run on laptop).
+
+Verify: Each repo has an image tag :latest after push.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B4 — Secrets Manager
+------------------------------------------------------------------------------
+Where: Secrets Manager → Store a new secret
+
+1. Other type of secret
+2. Key/value:
+     JWT_SECRET = (long random string)
+     ML_INTERNAL_TOKEN = (random string)
+3. Secret name: person-detection/app-secrets
+4. Disable rotation (demo)
+5. Store
+
+Verify: Secrets → person-detection/app-secrets → Retrieve shows keys.
+
+(You will attach this in ECS task definition later.)
+
+------------------------------------------------------------------------------
+CONSOLE STEP B5 — S3 bucket for uploads
+------------------------------------------------------------------------------
+Where: S3 → Create bucket
+
+1. Bucket name: person-detection-uploads-YOURACCOUNTID (globally unique)
+2. Region: same as EC2/ECS
+3. Block all public access: ON
+4. Create bucket
+5. Bucket → Management → Lifecycle rule → Prefix uploads/ → Expire 7 days
+
+Verify: Bucket list shows new bucket, no public access.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B6 — ElastiCache Redis
+------------------------------------------------------------------------------
+Where: ElastiCache → Redis clusters → Create Redis cluster
+
+1. Design: Cluster cache (not serverless for learning)
+2. Name: person-detection-redis
+3. Engine Redis 7
+4. Node type: cache.t3.micro
+5. Subnet group: create new → private subnets
+6. Security group: sg-redis
+7. Create
+
+Verify: Status available → copy Primary endpoint → redis://ENDPOINT:6379/0
+
+------------------------------------------------------------------------------
+CONSOLE STEP B7 — ACM certificate (HTTPS)
+------------------------------------------------------------------------------
+Where: Certificate Manager → Request certificate
+
+1. Request public certificate
+2. Domain names: app.example.com AND api.example.com (your real domain)
+3. Validation: DNS validation
+4. Request
+5. ACM → certificate → Create records in Route 53 (or add CNAME at registrar)
+
+Verify: Status = Issued
+
+Note: ACM must be in SAME region as ALB (not CloudFront us-east-1 exception).
+
+------------------------------------------------------------------------------
+CONSOLE STEP B8 — Application Load Balancer
+------------------------------------------------------------------------------
+Where: EC2 → Load Balancers → Create load balancer → Application Load Balancer
+
+1. Name: person-detection-alb
+2. Scheme: Internet-facing
+3. IP address type: IPv4
+4. Network mapping: person-detection-vpc, select BOTH public subnets
+5. Security group: sg-alb-person-detection
+6. Listeners: HTTPS 443 → forward to (create target group later) — complete wizard
+
+Target groups (EC2 left menu → Target Groups):
+
+TG-frontend:
+  - Target type: IP
+  - Protocol HTTP, Port 8501, VPC person-detection-vpc
+  - Health check path: /_stcore/health
+
+TG-backend:
+  - Target type: IP, Port 8000
+  - Health check path: /healthz
+
+ALB → Listeners → HTTPS 443:
+  - Default action → forward to TG-frontend
+  - Add rule Priority 1: Host header api.example.com → TG-backend
+
+Verify: ALB state active, DNS name visible (for Route 53).
+
+------------------------------------------------------------------------------
+CONSOLE STEP B9 — ECS cluster
+------------------------------------------------------------------------------
+Where: ECS → Clusters → Create cluster
+
+1. Name: person-detection-cluster
+2. Infrastructure: AWS Fargate (serverless)
+3. Enable Container Insights (optional)
+4. Create
+
+Verify: Cluster shows Active.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B10 — Cloud Map (service discovery for ML)
+------------------------------------------------------------------------------
+Where: Cloud Map → Namespaces → Create namespace
+
+1. Type: HTTP namespace OR DNS private (ECS often uses private DNS)
+   For ECS service connect / Cloud Map private DNS:
+   - Create namespace: person-detection.local (VPC = person-detection-vpc)
+2. Create service inside namespace: name ml
+
+Verify: Namespace person-detection.local exists.
+
+(Exact UI varies; when creating ML ECS service, enable Service discovery →
+ select namespace + service name ml.)
+
+------------------------------------------------------------------------------
+CONSOLE STEP B11 — CloudWatch log groups
+------------------------------------------------------------------------------
+Where: CloudWatch → Log groups → Create log group
+
+Create:
+  /ecs/person-detection/frontend
+  /ecs/person-detection/backend
+  /ecs/person-detection/ml
+
+Verify: Three log groups listed.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B12 — IAM roles for ECS
+------------------------------------------------------------------------------
+Where: IAM → Roles → Create role
+
+Role 1 — ecsTaskExecutionRole (AWS may already exist)
+  - Trusted entity: Elastic Container Service → Elastic Container Service Task
+  - Attach: AmazonECSTaskExecutionRolePolicy
+  - Add inline policy for secretsmanager:GetSecretValue on your secret ARN
+
+Role 2 — person-detection-backend-task
+  - Same trust as above
+  - Inline policy: s3 Put/Get on your uploads bucket
+
+Verify: Roles appear in ECS task definition dropdowns.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B13 — ECS task definitions (3 tasks)
+------------------------------------------------------------------------------
+Where: ECS → Task definitions → Create new task definition → Create
+
+Common settings (all three):
+  - Launch type: Fargate
+  - OS: Linux
+  - Task size: e.g. 1 vCPU 2 GB (ml may need 2 vCPU)
+  - Task role / Execution role as above
+  - Network mode: awsvpc
+
+Container ml-service:
+  - Image: ACCOUNT.dkr.ecr.REGION.amazonaws.com/person-detection/ml-service:latest
+  - Port 9000
+  - Env: DETECTOR=onnx, ML_INTERNAL_TOKEN from Secrets Manager
+  - Log config: awslogs → /ecs/person-detection/ml
+
+Container backend:
+  - Image: .../backend:latest, Port 8000
+  - Env: ML_SERVICE_URL=http://ml.person-detection.local:9000
+          REDIS_URL=redis://REDIS_ENDPOINT:6379/0
+          S3_BUCKET=your-bucket
+  - Secrets: JWT_SECRET, ML_INTERNAL_TOKEN from secret
+
+Container frontend:
+  - Image: .../frontend:latest, Port 8501
+  - Env: BACKEND_URL=https://api.example.com
+
+Verify: 3 task definitions registered.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B14 — ECS services (3 services)
+------------------------------------------------------------------------------
+Where: ECS → Clusters → person-detection-cluster → Create service
+
+Service ml-service:
+  - Task definition: ml
+  - Desired tasks: 1
+  - VPC private subnets, no public IP
+  - Security group: sg-ml
+  - Service discovery: namespace person-detection.local, service name ml
+  - NO load balancer
+
+Service backend:
+  - Task definition: backend
+  - Private subnets, sg-backend
+  - Load balancer: ALB → TG-backend, container port 8000
+
+Service frontend:
+  - Task definition: frontend
+  - Private subnets, sg-frontend
+  - Load balancer: ALB → TG-frontend, container port 8501
+
+Wait: Running count = desired, target groups healthy.
+
+Verify: EC2 → Target Groups → Targets tab → healthy.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B15 — Route 53 DNS
+------------------------------------------------------------------------------
+Where: Route 53 → Hosted zones → (create or select your domain)
+
+1. Create record:
+   - app.example.com → Alias → ALB person-detection-alb
+2. Create record:
+   - api.example.com → Alias → same ALB
+
+Verify: dig app.example.com resolves to ALB.
+
+Browser: https://app.example.com (after ACM issued + services healthy).
+
+------------------------------------------------------------------------------
+CONSOLE STEP B16 — AWS Budgets (cost alert)
+------------------------------------------------------------------------------
+Where: Billing → Budgets → Create budget
+
+1. Cost budget, monthly, amount e.g. $50
+2. Alert at 80% email
+
+Verify: Budget appears on Billing dashboard.
+
+------------------------------------------------------------------------------
+CONSOLE STEP B17 — NLB + coturn (optional WebRTC, later)
+------------------------------------------------------------------------------
+Where: EC2 → Load Balancers → Create → Network Load Balancer
+
+1. Name person-detection-nlb, public subnets
+2. Listener UDP 3478 → target group → coturn ECS task
+3. Deploy coturn image on ECS (public subnet or awsvpc with published UDP)
+
+Frontend env STUN_SERVER=stun:NLB-DNS:3478
+
+Skip until you need public webcam without SSH tunnel.
+
+
+================================================================================
+QUICK REFERENCE — Console search names
+================================================================================
+IAM          → Users, Roles
+EC2          → Instances, Security Groups, Key Pairs, Load Balancers, Target Groups
+VPC          → Your VPCs, Subnets, Route tables, NAT gateways
+ECR          → Repositories
+ECS          → Clusters, Task definitions, Services
+ElastiCache  → Redis clusters
+S3           → Buckets
+Secrets Manager → Secrets
+Certificate Manager → Certificates
+Route 53     → Hosted zones
+CloudWatch   → Log groups, Alarms
+Billing      → Budgets
+
+================================================================================
+ORDER CHECKLIST (website only)
+================================================================================
+[ ] A1 IAM user
+[ ] A2 Key pair
+[ ] A3 Security group
+[ ] A4 EC2 launch
+[ ] A7-A8 Docker + compose on EC2  ← stop here for learning milestone
+
+[ ] B1 VPC
+[ ] B2 Security groups (6)
+[ ] B3 ECR + push images from laptop
+[ ] B4 Secrets
+[ ] B5 S3
+[ ] B6 Redis
+[ ] B7 ACM
+[ ] B8 ALB + target groups
+[ ] B9 ECS cluster
+[ ] B10 Cloud Map
+[ ] B11 Log groups
+[ ] B12 IAM ECS roles
+[ ] B13 Task definitions
+[ ] B14 ECS services
+[ ] B15 Route 53
+[ ] B16 Budgets
+[ ] B17 NLB optional
+
